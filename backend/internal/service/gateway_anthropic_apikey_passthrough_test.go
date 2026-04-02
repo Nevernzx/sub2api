@@ -267,6 +267,129 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardCountTokensPreservesBo
 }
 
 // TestGatewayService_AnthropicAPIKeyPassthrough_ModelMappingEdgeCases 覆盖透传模式下模型映射的各种边界情况
+func TestGatewayService_AnthropicAPIKeyPassthrough_RelayCompatModePreservesOriginalBodyAndHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("User-Agent", "claude-cli/1.0.0")
+	c.Request.Header.Set("Authorization", "Bearer inbound-token")
+	c.Request.Header.Set("X-Api-Key", "inbound-api-key")
+	c.Request.Header.Set("Cookie", "secret=1")
+	c.Request.Header.Set("X-Upstream-Signature", "sig-123")
+	c.Request.Header.Set("X-Forwarded-For", "198.51.100.10")
+
+	body := []byte(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":[{"type":"text","text":"keep"},{"type":"text","text":""}]}]}`)
+	parsed := &ParsedRequest{
+		Body:  body,
+		Model: "claude-sonnet-4-20250514",
+	}
+
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":3}}`)),
+		},
+	}
+
+	svc := &GatewayService{
+		cfg:              &config.Config{},
+		httpUpstream:     upstream,
+		rateLimitService: &RateLimitService{},
+	}
+
+	account := &Account{
+		ID:          103,
+		Name:        "anthropic-apikey-relay-pass",
+		Platform:    PlatformAnthropic,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":       "upstream-anthropic-key",
+			"base_url":      "https://relay.example.com",
+			"model_mapping": map[string]any{"claude-sonnet-4-20250514": "claude-3-opus-20240229"},
+		},
+		Extra:       map[string]any{"anthropic_passthrough": true},
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, body, upstream.lastBody, "relay 兼容透传不应改写请求体")
+	require.Equal(t, "upstream-anthropic-key", getHeaderRaw(upstream.lastReq.Header, "x-api-key"))
+	require.Empty(t, getHeaderRaw(upstream.lastReq.Header, "authorization"))
+	require.Empty(t, getHeaderRaw(upstream.lastReq.Header, "cookie"))
+	require.Equal(t, "sig-123", getHeaderRaw(upstream.lastReq.Header, "x-upstream-signature"), "relay 兼容透传应保留未知签名头")
+	require.Empty(t, getHeaderRaw(upstream.lastReq.Header, "x-forwarded-for"), "relay 兼容透传仍应过滤代理链路头")
+
+	rawBody, ok := c.Get(OpsUpstreamRequestBodyKey)
+	require.True(t, ok)
+	bodyBytes, ok := rawBody.([]byte)
+	require.True(t, ok)
+	require.Equal(t, body, bodyBytes)
+}
+
+func TestGatewayService_AnthropicAPIKeyPassthrough_RelayCompatModeCountTokensPreservesOriginalBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
+	c.Request.Header.Set("Authorization", "Bearer inbound-token")
+	c.Request.Header.Set("X-Api-Key", "inbound-api-key")
+	c.Request.Header.Set("Cookie", "secret=1")
+	c.Request.Header.Set("X-Upstream-Signature", "sig-456")
+
+	body := []byte(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":[{"type":"text","text":"keep"},{"type":"text","text":""}]}]}`)
+	parsed := &ParsedRequest{
+		Body:  body,
+		Model: "claude-sonnet-4-20250514",
+	}
+
+	upstreamRespBody := `{"input_tokens":42}`
+	upstream := &anthropicHTTPUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(upstreamRespBody)),
+		},
+	}
+
+	svc := &GatewayService{
+		cfg:              &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}},
+		httpUpstream:     upstream,
+		rateLimitService: &RateLimitService{},
+	}
+
+	account := &Account{
+		ID:          104,
+		Name:        "anthropic-apikey-relay-count",
+		Platform:    PlatformAnthropic,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":       "upstream-anthropic-key",
+			"base_url":      "https://relay.example.com",
+			"model_mapping": map[string]any{"claude-sonnet-4-20250514": "claude-3-opus-20240229"},
+		},
+		Extra:       map[string]any{"anthropic_passthrough": true},
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+
+	err := svc.ForwardCountTokens(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.Equal(t, body, upstream.lastBody, "relay 兼容 count_tokens 透传不应改写请求体")
+	require.Equal(t, "upstream-anthropic-key", getHeaderRaw(upstream.lastReq.Header, "x-api-key"))
+	require.Empty(t, getHeaderRaw(upstream.lastReq.Header, "authorization"))
+	require.Empty(t, getHeaderRaw(upstream.lastReq.Header, "cookie"))
+	require.Equal(t, "sig-456", getHeaderRaw(upstream.lastReq.Header, "x-upstream-signature"))
+}
+
 func TestGatewayService_AnthropicAPIKeyPassthrough_ModelMappingEdgeCases(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

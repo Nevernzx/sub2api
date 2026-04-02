@@ -90,6 +90,32 @@ var (
 	modelsListCacheStoreTotal atomic.Int64
 )
 
+const officialAnthropicAPIHost = "api.anthropic.com"
+
+var anthropicPassthroughRelayBlockedHeaders = map[string]struct{}{
+	"authorization":       {},
+	"proxy-authorization": {},
+	"x-api-key":           {},
+	"x-goog-api-key":      {},
+	"cookie":              {},
+	"host":                {},
+	"content-length":      {},
+	"transfer-encoding":   {},
+	"connection":          {},
+	"proxy-connection":    {},
+	"keep-alive":          {},
+	"te":                  {},
+	"trailer":             {},
+	"upgrade":             {},
+	"forwarded":           {},
+	"x-forwarded-for":     {},
+	"x-forwarded-host":    {},
+	"x-forwarded-proto":   {},
+	"x-real-ip":           {},
+	"cf-connecting-ip":    {},
+	"true-client-ip":      {},
+}
+
 func GatewayWindowCostPrefetchStats() (cacheHit, cacheMiss, batchSQL, fallback, errCount int64) {
 	return windowCostPrefetchCacheHitTotal.Load(),
 		windowCostPrefetchCacheMissTotal.Load(),
@@ -373,9 +399,45 @@ var allowedHeaders = map[string]bool{
 	"x-client-request-id":                       true,
 }
 
-// GatewayCache 定义网关服务的缓存操作接口。
-// 提供粘性会话（Sticky Session）的存储、查询、刷新和删除功能。
-//
+// isOfficialAnthropicBaseURL reports whether an account targets Anthropic's
+// first-party API host instead of a third-party relay.
+func isOfficialAnthropicBaseURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(parsed.Hostname(), officialAnthropicAPIHost)
+}
+
+// anthropicPassthroughUsesRelayCompatMode enables stricter "auth only"
+// passthrough semantics for relays that verify original headers/body.
+func (s *GatewayService) anthropicPassthroughUsesRelayCompatMode(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	return !isOfficialAnthropicBaseURL(account.GetBaseURL())
+}
+
+// shouldForwardAnthropicPassthroughHeader keeps the historical whitelist for
+// direct Anthropic traffic, but switches to a denylist for relay compatibility.
+func shouldForwardAnthropicPassthroughHeader(key string, relayCompatMode bool) bool {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	if lowerKey == "" {
+		return false
+	}
+	if !relayCompatMode {
+		return allowedHeaders[lowerKey]
+	}
+	_, blocked := anthropicPassthroughRelayBlockedHeaders[lowerKey]
+	return !blocked
+}
+
 // GatewayCache defines cache operations for gateway service.
 // Provides sticky session storage, retrieval, refresh and deletion capabilities.
 type GatewayCache interface {
@@ -4102,9 +4164,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	if account != nil && account.IsAnthropicAPIKeyPassthroughEnabled() {
+		relayCompatMode := s.anthropicPassthroughUsesRelayCompatMode(account)
 		passthroughBody := parsed.Body
 		passthroughModel := parsed.Model
-		if passthroughModel != "" {
+		if !relayCompatMode && passthroughModel != "" {
 			if mappedModel := account.GetMappedModel(passthroughModel); mappedModel != passthroughModel {
 				passthroughBody = s.replaceModelInBody(passthroughBody, mappedModel)
 				logger.LegacyPrintf("service.gateway", "Passthrough model mapping: %s -> %s (account: %s)", parsed.Model, mappedModel, account.Name)
@@ -4723,8 +4786,10 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	if c != nil {
 		c.Set("anthropic_passthrough", true)
 	}
-	// Pre-filter: strip empty text blocks (including nested in tool_result) to prevent upstream 400.
-	input.Body = StripEmptyTextBlocks(input.Body)
+	if !s.anthropicPassthroughUsesRelayCompatMode(account) {
+		// Keep direct Anthropic traffic compatible with existing gateway behavior.
+		input.Body = StripEmptyTextBlocks(input.Body)
+	}
 
 	// 重试间复用同一请求体，避免每次 string(body) 产生额外分配。
 	setOpsUpstreamRequestBody(c, input.Body)
@@ -4946,9 +5011,9 @@ func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	}
 
 	if c != nil && c.Request != nil {
+		relayCompatMode := s.anthropicPassthroughUsesRelayCompatMode(account)
 		for key, values := range c.Request.Header {
-			lowerKey := strings.ToLower(strings.TrimSpace(key))
-			if !allowedHeaders[lowerKey] {
+			if !shouldForwardAnthropicPassthroughHeader(key, relayCompatMode) {
 				continue
 			}
 			wireKey := resolveWireCasing(key)
@@ -8073,11 +8138,12 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 	}
 
 	if account != nil && account.IsAnthropicAPIKeyPassthroughEnabled() {
+		relayCompatMode := s.anthropicPassthroughUsesRelayCompatMode(account)
 		passthroughBody := parsed.Body
-		if reqModel := parsed.Model; reqModel != "" {
-			if mappedModel := account.GetMappedModel(reqModel); mappedModel != reqModel {
+		if !relayCompatMode && parsed.Model != "" {
+			if mappedModel := account.GetMappedModel(parsed.Model); mappedModel != parsed.Model {
 				passthroughBody = s.replaceModelInBody(passthroughBody, mappedModel)
-				logger.LegacyPrintf("service.gateway", "CountTokens passthrough model mapping: %s -> %s (account: %s)", reqModel, mappedModel, account.Name)
+				logger.LegacyPrintf("service.gateway", "CountTokens passthrough model mapping: %s -> %s (account: %s)", parsed.Model, mappedModel, account.Name)
 			}
 		}
 		return s.forwardCountTokensAnthropicAPIKeyPassthrough(ctx, c, account, passthroughBody)
@@ -8393,9 +8459,9 @@ func (s *GatewayService) buildCountTokensRequestAnthropicAPIKeyPassthrough(
 	}
 
 	if c != nil && c.Request != nil {
+		relayCompatMode := s.anthropicPassthroughUsesRelayCompatMode(account)
 		for key, values := range c.Request.Header {
-			lowerKey := strings.ToLower(strings.TrimSpace(key))
-			if !allowedHeaders[lowerKey] {
+			if !shouldForwardAnthropicPassthroughHeader(key, relayCompatMode) {
 				continue
 			}
 			wireKey := resolveWireCasing(key)
