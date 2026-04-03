@@ -265,12 +265,37 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Flush()
 
-	// Create Claude Code style payload (same for all account types)
-	payload, err := createTestPayload(testModelID)
-	if err != nil {
-		return s.sendErrorAndEnd(c, "Failed to create test payload")
+	// Create test payload
+	var payloadBytes []byte
+	relayCompatMode := account.IsAnthropicAPIKeyPassthroughEnabled() && !isOfficialAnthropicBaseURL(account.GetBaseURL())
+
+	if relayCompatMode {
+		// Relay compat mode: use minimal payload without cache_control or metadata
+		log.Printf("[Relay Compat Mode] Using minimal payload for account: %s (base_url: %s)", account.Name, account.GetBaseURL())
+		minimalPayload := map[string]any{
+			"model": testModelID,
+			"messages": []map[string]any{
+				{
+					"role": "user",
+					"content": "hi",
+				},
+			},
+			"max_tokens": 100,
+			"stream":     true,
+		}
+		payloadBytes, _ = json.Marshal(minimalPayload)
+		log.Printf("[Relay Compat Mode] Payload: %s", string(payloadBytes))
+	} else {
+		// Standard mode: use full Claude Code style payload
+		log.Printf("[Standard Mode] Using full Claude Code payload for account: %s", account.Name)
+		payload, err := createTestPayload(testModelID)
+		if err != nil {
+			return s.sendErrorAndEnd(c, "Failed to create test payload")
+		}
+		payloadBytes, _ = json.Marshal(payload)
+		// Strip empty text blocks to prevent upstream 400
+		payloadBytes = StripEmptyTextBlocks(payloadBytes)
 	}
-	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event
 	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
@@ -284,9 +309,11 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	// Apply Claude Code client headers
-	for key, value := range claude.DefaultHeaders {
-		req.Header.Set(key, value)
+	// Apply Claude Code client headers (skip for relay compat mode)
+	if !relayCompatMode {
+		for key, value := range claude.DefaultHeaders {
+			req.Header.Set(key, value)
+		}
 	}
 
 	// Set authentication header
@@ -294,7 +321,11 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 		req.Header.Set("anthropic-beta", claude.DefaultBetaHeader)
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	} else {
-		req.Header.Set("anthropic-beta", claude.APIKeyBetaHeader)
+		if !relayCompatMode {
+			// Standard mode: use API key beta header
+			req.Header.Set("anthropic-beta", claude.APIKeyBetaHeader)
+		}
+		// Always set x-api-key for API key accounts
 		req.Header.Set("x-api-key", authToken)
 	}
 
@@ -312,7 +343,14 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		errMsg := fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body))
+
+		// Debug info for relay compat mode
+		debugInfo := ""
+		if relayCompatMode {
+			debugInfo = fmt.Sprintf(" [DEBUG: Relay Compat Mode, Payload: %s]", string(payloadBytes))
+		}
+
+		errMsg := fmt.Sprintf("API returned %d: %s%s", resp.StatusCode, string(body), debugInfo)
 
 		// 403 表示账号被上游封禁，标记为 error 状态
 		if resp.StatusCode == http.StatusForbidden {
